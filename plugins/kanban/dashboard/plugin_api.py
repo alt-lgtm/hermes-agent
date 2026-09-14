@@ -1958,10 +1958,34 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    kanban_config = config.get("kanban", {}) if isinstance(config, dict) else {}
+    default_assignee = (kanban_config.get("default_assignee") or "").strip() or None
+    recovery_fixer_assignee = (
+        (kanban_config.get("recovery_fixer_assignee") or "").strip()
+        or default_assignee
+    )
+    try:
+        recovery_queue_per_tick = max(
+            1, int(kanban_config.get("recovery_queue_per_tick", 3)),
+        )
+    except (TypeError, ValueError):
+        recovery_queue_per_tick = 3
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
+            default_assignee=default_assignee,
+            recovery_queue_enabled=bool(
+                kanban_config.get("recovery_queue_enabled", False)
+            ),
+            recovery_queue_per_tick=recovery_queue_per_tick,
+            recovery_fixer_assignee=recovery_fixer_assignee,
         )
         # DispatchResult is a dataclass.
         try:

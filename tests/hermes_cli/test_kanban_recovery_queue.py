@@ -388,6 +388,70 @@ def test_dispatch_routes_dependency_when_generic_recovery_is_disabled(
         assert kb.get_task(conn, review_id).status == "todo"
 
 
+def test_dependency_bound_after_block_waits_for_parent_without_remediation(
+    kanban_home: Path,
+) -> None:
+    """A late parent link converts an unbound block into a normal wait."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="waiting for implementation", kind="dependency",
+        )
+        implementation_id = kb.create_task(
+            conn, title="Implementation", assignee="implementer",
+        )
+        kb.link_tasks(conn, implementation_id, review_id)
+
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert result.recovered == []
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "todo"
+        assert [
+            task for task in kb.list_tasks(conn)
+            if task.classification == "remediation"
+        ] == []
+
+
+def test_stale_dependency_source_archives_new_remediation(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source unblocked during creation cannot leave runnable orphan work."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+        real_create_task = kb.create_task
+
+        def create_then_unblock(*args, **kwargs):
+            successor_id = real_create_task(*args, **kwargs)
+            assert kb.unblock_task(conn, review_id)
+            return successor_id
+
+        monkeypatch.setattr(kb, "create_task", create_then_unblock)
+
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert result.recovered == []
+        remediations = [
+            task for task in kb.list_tasks(conn, status="archived")
+            if task.classification == "remediation"
+        ]
+        assert len(remediations) == 1
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ?",
+            (remediations[0].id,),
+        ).fetchone() is None
+
+
 # ---------------------------------------------------------------------------
 # Per-tick cap
 # ---------------------------------------------------------------------------

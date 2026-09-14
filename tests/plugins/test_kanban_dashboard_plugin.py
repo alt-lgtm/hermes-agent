@@ -606,6 +606,37 @@ def test_dispatch_dry_run(client):
     assert isinstance(body, dict)
 
 
+def test_dispatch_honors_configured_recovery_fixer(
+    client, kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dashboard nudges pass the same recovery config as gateway dispatch."""
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  default_assignee: default-worker\n"
+        "  recovery_fixer_assignee: code-fixer\n"
+        "  recovery_queue_enabled: true\n"
+        "  recovery_queue_per_tick: 7\n",
+        encoding="utf-8",
+    )
+    module = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    captured = {}
+    real_dispatch = module.kanban_db.dispatch_once
+
+    def capture_dispatch(*args, **kwargs):
+        captured.update(kwargs)
+        return real_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(module.kanban_db, "dispatch_once", capture_dispatch)
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
+
+    assert response.status_code == 200
+    assert captured["default_assignee"] == "default-worker"
+    assert captured["recovery_fixer_assignee"] == "code-fixer"
+    assert captured["recovery_queue_enabled"] is True
+    assert captured["recovery_queue_per_tick"] == 7
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------

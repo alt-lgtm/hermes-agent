@@ -9088,6 +9088,34 @@ def recover_blocked_tasks(
             result.skipped_safety.append(source_id)
             continue
 
+        if is_dependency:
+            pending_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if pending_parent:
+                # A parent may be linked after block_task parked the unbound
+                # finding. Convert it to the ordinary dependency wait instead
+                # of manufacturing a redundant remediation prerequisite.
+                with write_txn(conn):
+                    moved = conn.execute(
+                        "UPDATE tasks SET status = 'todo' "
+                        "WHERE id = ? AND status = 'blocked' "
+                        "AND block_kind = 'dependency'",
+                        (source_id,),
+                    )
+                    if moved.rowcount == 1:
+                        _append_event(
+                            conn,
+                            source_id,
+                            "dependency_bound",
+                            {"status": "todo"},
+                        )
+                continue
+
         # Use latest comment for review-marker eligibility.
         latest_comment = all_comments[0] if all_comments else None
         comment_body: str = ""
@@ -9164,6 +9192,11 @@ def recover_blocked_tasks(
         # audit event that create_task emits.  ``initial_status="ready"``
         # ensures the successor is immediately dispatchable regardless
         # of parent state.
+        prior_successor = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' LIMIT 1",
+            (idemp_key,),
+        ).fetchone()
         successor_id = create_task(
             conn,
             title=successor_title,
@@ -9235,6 +9268,15 @@ def recover_blocked_tasks(
                         "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
                         (successor_id, source_id),
                     )
+                    if prior_successor is None:
+                        # create_task commits independently. Retire the task we
+                        # just created so it cannot dispatch as orphaned work.
+                        conn.execute(
+                            "UPDATE tasks SET status = 'archived' "
+                            "WHERE id = ? AND status = 'ready' "
+                            "AND created_by = 'recovery-queue'",
+                            (successor_id,),
+                        )
                     continue
 
             _append_event(

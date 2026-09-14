@@ -9196,12 +9196,17 @@ def recover_blocked_tasks(
             already_dispatched = False
             for event in dispatched_rows:
                 try:
-                    event_key = json.loads(event["payload"] or "{}").get(
-                        "idempotency_key"
-                    )
+                    event_payload = json.loads(event["payload"] or "{}")
+                    event_key = event_payload.get("idempotency_key")
+                    event_successor = event_payload.get("successor_id")
                 except (TypeError, ValueError):
                     event_key = None
-                if event_key == idemp_key:
+                    event_successor = None
+                # Archived successors no longer occupy the live idempotency
+                # key, so create_task may legitimately return a replacement.
+                # Deduplicate only the same live successor, not every historical
+                # task that ever carried this finding fingerprint.
+                if event_key == idemp_key and event_successor == successor_id:
                     already_dispatched = True
                     break
             if already_dispatched:

@@ -271,6 +271,47 @@ def test_same_finding_text_with_new_comment_is_idempotent(kanban_home: Path) -> 
         assert len(successors) == 1
 
 
+def test_archived_remediation_does_not_orphan_replacement(kanban_home: Path) -> None:
+    """A replacement for an archived successor gets its own edge and audit."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+        first = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+        first_remediation = first.recovered[0][1]
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id = ?",
+                (first_remediation,),
+            )
+        assert kb.recompute_ready(conn) == 1
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+
+        second = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert len(second.recovered) == 1
+        second_remediation = second.recovered[0][1]
+        assert second_remediation != first_remediation
+        assert kb.get_task(conn, review_id).status == "todo"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (second_remediation, review_id),
+        ).fetchone() is not None
+        dispatched = [
+            event for event in kb.list_events(conn, task_id=review_id)
+            if event.kind == "recovery_dispatched"
+        ]
+        assert len(dispatched) == 2
+
+
 def test_dependency_review_remediation_cycle(kanban_home: Path) -> None:
     """Reviewer waits for one fixer task, then wakes exactly once after it completes."""
     with kb.connect_closing() as conn:

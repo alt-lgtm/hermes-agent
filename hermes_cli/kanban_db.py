@@ -9051,7 +9051,8 @@ def recover_blocked_tasks(
     # after eligibility filtering in Python so that earlier-created but
     # ineligible rows cannot starve later eligible ones.
     blocked_rows = conn.execute(
-        "SELECT id, title, assignee, block_kind FROM tasks "
+        "SELECT id, title, assignee, block_kind, workspace_kind, "
+        "workspace_path, branch_name, tenant, project_id FROM tasks "
         "WHERE status = 'blocked' "
         "ORDER BY created_at ASC",
     ).fetchall()
@@ -9203,6 +9204,14 @@ def recover_blocked_tasks(
             body=successor_body,
             assignee=assignee,
             created_by="recovery-queue",
+            workspace_kind=(
+                (row["workspace_kind"] or "scratch")
+                if is_dependency else "scratch"
+            ),
+            workspace_path=row["workspace_path"] if is_dependency else None,
+            branch_name=row["branch_name"] if is_dependency else None,
+            tenant=row["tenant"] if is_dependency else None,
+            project_id=row["project_id"] if is_dependency else None,
             idempotency_key=idemp_key,
             initial_status="ready",
             classification="remediation" if is_dependency else "task",

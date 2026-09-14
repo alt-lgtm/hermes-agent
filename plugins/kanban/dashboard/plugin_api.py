@@ -1967,6 +1967,9 @@ def dispatch(
         (kanban_config.get("recovery_fixer_assignee") or "").strip()
         or default_assignee
     )
+    recovery_queue_enabled = str(
+        kanban_config.get("recovery_queue_enabled", False)
+    ).strip().lower() in {"1", "true", "yes", "on"}
     try:
         recovery_queue_per_tick = max(
             1, int(kanban_config.get("recovery_queue_per_tick", 3)),
@@ -1981,9 +1984,7 @@ def dispatch(
             max_spawn=max_n,
             board=board,
             default_assignee=default_assignee,
-            recovery_queue_enabled=bool(
-                kanban_config.get("recovery_queue_enabled", False)
-            ),
+            recovery_queue_enabled=recovery_queue_enabled,
             recovery_queue_per_tick=recovery_queue_per_tick,
             recovery_fixer_assignee=recovery_fixer_assignee,
         )

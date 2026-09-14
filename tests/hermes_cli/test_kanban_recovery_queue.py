@@ -320,6 +320,9 @@ def test_dependency_review_remediation_cycle(kanban_home: Path) -> None:
             title="Review change",
             assignee="reviewer",
             classification="review",
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home.parent),
+            branch_name="feature/review-change",
         )
         assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
         assert kb.block_task(
@@ -339,6 +342,9 @@ def test_dependency_review_remediation_cycle(kanban_home: Path) -> None:
         assert remediation.assignee == "implementer"
         assert remediation.classification == "remediation"
         assert remediation.status == "ready"
+        assert remediation.workspace_kind == "worktree"
+        assert remediation.workspace_path == str(kanban_home.parent)
+        assert remediation.branch_name == "feature/review-change"
         assert kb.get_task(conn, review_id).status == "todo"
         assert conn.execute(
             "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",

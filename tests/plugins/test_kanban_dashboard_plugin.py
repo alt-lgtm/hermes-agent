@@ -614,7 +614,7 @@ def test_dispatch_honors_configured_recovery_fixer(
         "kanban:\n"
         "  default_assignee: default-worker\n"
         "  recovery_fixer_assignee: code-fixer\n"
-        "  recovery_queue_enabled: true\n"
+        "  recovery_queue_enabled: 'false'\n"
         "  recovery_queue_per_tick: 7\n",
         encoding="utf-8",
     )
@@ -633,7 +633,7 @@ def test_dispatch_honors_configured_recovery_fixer(
     assert response.status_code == 200
     assert captured["default_assignee"] == "default-worker"
     assert captured["recovery_fixer_assignee"] == "code-fixer"
-    assert captured["recovery_queue_enabled"] is True
+    assert captured["recovery_queue_enabled"] is False
     assert captured["recovery_queue_per_tick"] == 7
 
 

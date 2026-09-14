@@ -121,6 +121,27 @@ def test_transient_without_comment(kanban_home: Path) -> None:
         assert len(result.recovered) == 1
 
 
+def test_generic_unassigned_task_keeps_legacy_recovery_behavior(
+    kanban_home: Path,
+) -> None:
+    """Only dependency remediation requires an explicitly routable fixer."""
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn, title="unassigned transient", assignee=None,
+        )
+        assert kb.block_task(
+            conn, source_id, reason="temporary failure", kind="transient",
+        )
+
+        result = kb.recover_blocked_tasks(conn)
+
+        assert len(result.recovered) == 1
+        assert result.recovered[0][0] == source_id
+        successor = kb.get_task(conn, result.recovered[0][1])
+        assert successor is not None
+        assert successor.assignee is None
+
+
 # ---------------------------------------------------------------------------
 # Safety skips
 # ---------------------------------------------------------------------------
@@ -248,8 +269,10 @@ def test_new_comment_gets_new_successor(kanban_home: Path) -> None:
         assert second.recovered[0][1] != first.recovered[0][1]
 
 
-def test_same_finding_text_with_new_comment_is_idempotent(kanban_home: Path) -> None:
-    """Finding identity is content-based, not tied to a new comment row id."""
+def test_generic_same_text_in_new_comment_gets_new_successor(
+    kanban_home: Path,
+) -> None:
+    """Generic recovery retains its historical source+comment identity."""
     with kb.connect_closing() as conn:
         tid = _blocked_task(
             conn, title="same finding", comment="review-required: Missing guard",
@@ -263,16 +286,48 @@ def test_same_finding_text_with_new_comment_is_idempotent(kanban_home: Path) -> 
         )
         second = kb.recover_blocked_tasks(conn)
 
-        assert second.recovered == []
-        assert second.skipped_idempotent == [tid]
+        assert len(second.recovered) == 1
+        assert second.recovered[0][1] != first.recovered[0][1]
         successors = conn.execute(
             "SELECT id FROM tasks WHERE created_by = 'recovery-queue'"
         ).fetchall()
-        assert len(successors) == 1
+        assert len(successors) == 2
 
 
-def test_archived_remediation_does_not_orphan_replacement(kanban_home: Path) -> None:
-    """A replacement for an archived successor gets its own edge and audit."""
+def test_generic_archived_successor_is_replaced_and_audited(
+    kanban_home: Path,
+) -> None:
+    """Generic recovery keeps the legacy archived-replacement behavior."""
+    with kb.connect_closing() as conn:
+        source_id = _blocked_task(
+            conn, title="retry archived", block_kind="transient",
+        )
+        first = kb.recover_blocked_tasks(conn)
+        first_successor = first.recovered[0][1]
+        assert kb.archive_task(conn, first_successor)
+
+        second = kb.recover_blocked_tasks(conn)
+
+        assert len(second.recovered) == 1
+        replacement = second.recovered[0][1]
+        assert replacement != first_successor
+        replacement_task = kb.get_task(conn, replacement)
+        assert replacement_task is not None
+        assert replacement_task.status == "ready"
+        dispatched = [
+            event for event in kb.list_events(conn, source_id)
+            if event.kind == "recovery_dispatched"
+        ]
+        assert len(dispatched) == 2
+        latest_payload = dispatched[-1].payload
+        assert latest_payload is not None
+        assert latest_payload["successor_id"] == replacement
+
+
+def test_archived_remediation_keeps_review_waiting_without_replacement(
+    kanban_home: Path,
+) -> None:
+    """Archiving a fixer cannot wake or duplicate its unchanged finding."""
     with kb.connect_closing() as conn:
         review_id = kb.create_task(
             conn, title="Review", assignee="reviewer", classification="review",
@@ -284,32 +339,63 @@ def test_archived_remediation_does_not_orphan_replacement(kanban_home: Path) -> 
         first = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
         first_remediation = first.recovered[0][1]
 
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'archived' WHERE id = ?",
-                (first_remediation,),
-            )
-        assert kb.recompute_ready(conn) == 1
-        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
-        assert kb.block_task(
-            conn, review_id, reason="finding: missing guard", kind="dependency",
-        )
+        assert kb.archive_task(conn, first_remediation)
+        assert kb.recompute_ready(conn) == 0
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "todo"
 
         second = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
 
-        assert len(second.recovered) == 1
-        second_remediation = second.recovered[0][1]
-        assert second_remediation != first_remediation
-        assert kb.get_task(conn, review_id).status == "todo"
-        assert conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-            (second_remediation, review_id),
-        ).fetchone() is not None
+        assert second.recovered == []
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "todo"
+        successors = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = 'recovery-queue'"
+        ).fetchall()
+        assert [row["id"] for row in successors] == [first_remediation]
         dispatched = [
             event for event in kb.list_events(conn, task_id=review_id)
             if event.kind == "recovery_dispatched"
         ]
-        assert len(dispatched) == 2
+        assert len(dispatched) == 1
+
+
+def test_completed_fingerprint_is_not_remediated_twice(kanban_home: Path) -> None:
+    """The same normalized finding maps to one remediation for its lifetime."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+        first = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+        remediation_id = first.recovered[0][1]
+        assert kb.claim_task(conn, remediation_id, claimer="implementer") is not None
+        assert kb.complete_task(conn, remediation_id, summary="fixed")
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "ready"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn,
+            review_id,
+            reason="  FINDING:   missing guard  ",
+            kind="dependency",
+        )
+
+        second = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert second.recovered == []
+        assert second.skipped_idempotent == [review_id]
+        successors = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = 'recovery-queue'"
+        ).fetchall()
+        assert [row["id"] for row in successors] == [remediation_id]
 
 
 def test_dependency_review_remediation_cycle(kanban_home: Path) -> None:
@@ -456,6 +542,185 @@ def test_stale_dependency_source_archives_new_remediation(
             "SELECT 1 FROM task_links WHERE parent_id = ?",
             (remediations[0].id,),
         ).fetchone() is None
+
+
+def test_archived_remediation_cannot_release_dependency_source(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successor archived before linking must leave the review blocked."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+        real_create_task = kb.create_task
+
+        def create_then_archive(*args, **kwargs):
+            successor_id = real_create_task(*args, **kwargs)
+            assert kb.archive_task(conn, successor_id)
+            return successor_id
+
+        monkeypatch.setattr(kb, "create_task", create_then_archive)
+
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert result.recovered == []
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "blocked"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ?",
+            (review_id,),
+        ).fetchone() is None
+
+
+def test_remediation_staging_cannot_be_promoted_or_claimed(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second dispatcher cannot claim a fixer before its edge is published."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing guard", kind="dependency",
+        )
+        real_create_task = kb.create_task
+
+        def interleave_other_dispatcher(*args, **kwargs):
+            remediation_id = real_create_task(*args, **kwargs)
+            if kwargs.get("classification") == "remediation":
+                with kb.connect_closing() as other:
+                    assert kb.recompute_ready(other) == 0
+                    promoted, error = kb.promote_task(
+                        other, remediation_id,
+                        actor="racing-operator", force=True,
+                    )
+                    assert not promoted
+                    assert error == "recovery remediation is still being staged"
+                    assert not kb.unblock_task(other, remediation_id)
+                    with kb.write_txn(other):
+                        other.execute(
+                            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                            (remediation_id,),
+                        )
+                    assert kb.claim_task(
+                        other, remediation_id, claimer="racing-worker",
+                    ) is None
+                    staged = kb.get_task(other, remediation_id)
+                    assert staged is not None
+                    assert staged.status == "blocked"
+            return remediation_id
+
+        monkeypatch.setattr(kb, "create_task", interleave_other_dispatcher)
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        remediation_id = result.recovered[0][1]
+        remediation = kb.get_task(conn, remediation_id)
+        assert remediation is not None
+        assert remediation.status == "ready"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (remediation_id, review_id),
+        ).fetchone() is not None
+
+
+@pytest.mark.parametrize(
+    "second_reason",
+    ["finding: old bug", "finding: materially different bug"],
+)
+def test_source_reblock_retires_staged_remediation(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_reason: str,
+) -> None:
+    """Publication binds to a block generation, not only finding text."""
+    with kb.connect_closing() as conn:
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: old bug", kind="dependency",
+        )
+        real_create_task = kb.create_task
+        staged: list[str] = []
+
+        def create_then_reblock(*args, **kwargs):
+            successor_id = real_create_task(*args, **kwargs)
+            if kwargs.get("classification") == "remediation":
+                staged.append(successor_id)
+                assert kb.unblock_task(conn, review_id)
+                assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+                assert kb.block_task(
+                    conn, review_id,
+                    reason=second_reason,
+                    kind="dependency",
+                )
+            return successor_id
+
+        monkeypatch.setattr(kb, "create_task", create_then_reblock)
+
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert result.recovered == []
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "blocked"
+        staged_task = kb.get_task(conn, staged[0])
+        assert staged_task is not None
+        assert staged_task.status == "archived"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (staged[0], review_id),
+        ).fetchone() is None
+
+
+def test_parent_linked_during_staging_wins_over_remediation(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly attached live parent prevents redundant remediation publish."""
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="Implementation", assignee="worker")
+        review_id = kb.create_task(
+            conn, title="Review", assignee="reviewer", classification="review",
+        )
+        assert kb.claim_task(conn, review_id, claimer="reviewer") is not None
+        assert kb.block_task(
+            conn, review_id, reason="finding: missing fix", kind="dependency",
+        )
+        real_create_task = kb.create_task
+        staged: list[str] = []
+
+        def create_then_link_parent(*args, **kwargs):
+            successor_id = real_create_task(*args, **kwargs)
+            if kwargs.get("classification") == "remediation":
+                staged.append(successor_id)
+                kb.link_tasks(conn, parent_id, review_id)
+            return successor_id
+
+        monkeypatch.setattr(kb, "create_task", create_then_link_parent)
+
+        result = kb.recover_blocked_tasks(conn, fixer_assignee="implementer")
+
+        assert result.recovered == []
+        review = kb.get_task(conn, review_id)
+        assert review is not None
+        assert review.status == "todo"
+        staged_task = kb.get_task(conn, staged[0])
+        assert staged_task is not None
+        assert staged_task.status == "archived"
+        parents = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            (review_id,),
+        ).fetchall()
+        assert [row["parent_id"] for row in parents] == [parent_id]
 
 
 # ---------------------------------------------------------------------------

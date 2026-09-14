@@ -2462,6 +2462,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     classification: Optional[str] = None,
+    _initial_block_kind: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2493,6 +2494,13 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if _initial_block_kind is not None:
+        if initial_status != "blocked":
+            raise ValueError("_initial_block_kind requires initial_status='blocked'")
+        if _initial_block_kind not in VALID_BLOCK_KINDS:
+            raise ValueError(
+                f"_initial_block_kind must be one of {sorted(VALID_BLOCK_KINDS)}"
+            )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2705,8 +2713,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        classification
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        classification, block_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2730,6 +2738,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         classification,
+                        _initial_block_kind,
                     ),
                 )
                 for pid in parents:
@@ -2750,6 +2759,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "classification": classification,
+                        "block_kind": _initial_block_kind,
                     },
                 )
             return task_id
@@ -3363,10 +3373,87 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _recovery_dispatch_payloads(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[dict[str, Any]]:
+    """Return parseable recovery-dispatch payloads, newest first."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'recovery_dispatched' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def _recovery_dependency_unresolved(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return whether the latest recovery prerequisite has not completed.
+
+    Missing, archived, or malformed successors fail closed. A dependency
+    review may wake only after its recorded remediation reaches ``done``.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'recovery_dispatched' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return False
+    try:
+        payload = json.loads(rows[0]["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True
+    successor_id = payload.get("successor_id") if isinstance(payload, dict) else None
+    if not isinstance(successor_id, str) or not successor_id:
+        return True
+    successor = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (successor_id,),
+    ).fetchone()
+    return successor is None or successor["status"] != "done"
+
+
+def _is_staged_recovery_successor(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return whether a remediation is private staging, not runnable work."""
+    row = conn.execute(
+        "SELECT created_by, classification FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["created_by"] != "recovery-queue"
+        or row["classification"] != "remediation"
+    ):
+        return False
+    published = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'recovery_created' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return published is None
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks when their prerequisites are satisfied.
+
+    Ordinary archived parents are satisfied. A recovery-created remediation
+    is stricter: its review wakes only after that successor completes, never
+    merely because the successor was archived or deleted.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -3405,6 +3492,13 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if _is_staged_recovery_successor(conn, task_id):
+                continue
+            if (
+                row["block_kind"] == "dependency"
+                and _recovery_dependency_unresolved(conn, task_id)
+            ):
+                continue
             if cur_status == "blocked" and row["block_kind"] == "dependency":
                 # A dependency block with no pending parent is deliberately
                 # parked fail-closed until the recovery queue attaches a
@@ -3476,6 +3570,36 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _is_staged_recovery_successor(conn, task_id):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "recovery_remediation_staged"},
+            )
+            return None
+        task_state = conn.execute(
+            "SELECT block_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task_state is not None
+            and task_state["block_kind"] == "dependency"
+            and _recovery_dependency_unresolved(conn, task_id)
+        ):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "recovery_dependency_unresolved"},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4882,10 +5006,13 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+
+    if _is_staged_recovery_successor(conn, task_id):
+        return False, "recovery remediation is still being staged"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -4895,6 +5022,14 @@ def promote_task(
         )
 
     if not force:
+        if (
+            row["block_kind"] == "dependency"
+            and _recovery_dependency_unresolved(conn, task_id)
+        ):
+            return False, (
+                "recovery remediation has not completed "
+                "(use --force to override)"
+            )
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
@@ -4944,6 +5079,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if _is_staged_recovery_successor(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -5331,9 +5468,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
+    # Ordinary archived parents no longer block children. Recovery remediation
+    # is deliberately stricter: recompute_ready keeps its reviewer waiting
+    # until the recorded successor actually completes.
     recompute_ready(conn)
     return True
 
@@ -8069,6 +8206,7 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    recovery_fixer_assignee: Optional[str] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -8106,6 +8244,7 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    recovery_fixer_assignee=recovery_fixer_assignee,
                 )
             if on_tick is not None:
                 try:
@@ -9001,6 +9140,44 @@ def _recovery_finding_fingerprint(finding: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
+def _current_dependency_finding(conn: sqlite3.Connection, task_id: str) -> str:
+    """Read the latest dependency finding used for remediation identity."""
+    blocking_event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('dependency_wait', 'blocked', 'block_loop_detected') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    blocking_reason = ""
+    if blocking_event:
+        try:
+            payload = json.loads(blocking_event["payload"] or "{}")
+            if isinstance(payload, dict):
+                blocking_reason = str(payload.get("reason") or "")
+        except (TypeError, ValueError):
+            pass
+    latest_comment = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    comment_body = str(latest_comment["body"] or "") if latest_comment else ""
+    return blocking_reason or comment_body or "dependency"
+
+
+def _current_dependency_generation(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Return the event id that identifies the current dependency block run."""
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind IN ('dependency_wait', 'blocked', 'block_loop_detected') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
 def recover_blocked_tasks(
     conn: sqlite3.Connection,
     *,
@@ -9119,6 +9296,7 @@ def recover_blocked_tasks(
 
         # Use latest comment for review-marker eligibility.
         latest_comment = all_comments[0] if all_comments else None
+        comment_id = int(latest_comment["id"]) if latest_comment else 0
         comment_body: str = ""
         if latest_comment:
             comment_body = latest_comment["body"] or ""
@@ -9156,12 +9334,29 @@ def recover_blocked_tasks(
         # legacy review queue uses its latest marker comment. Content identity,
         # rather than the comment row id, prevents duplicate remediation fanout.
         finding = (
-            (blocking_reason or comment_body or "dependency")
+            _current_dependency_finding(conn, source_id)
             if is_dependency
             else (comment_body or blocking_reason or block_kind or "blocked")
         )
-        fingerprint = _recovery_finding_fingerprint(finding)
-        idemp_key = f"recovery:{source_id}:{fingerprint}"
+        fingerprint = _recovery_finding_fingerprint(finding) if is_dependency else None
+        dependency_generation = (
+            _current_dependency_generation(conn, source_id)
+            if is_dependency else None
+        )
+        idemp_key = (
+            f"recovery:{source_id}:{fingerprint}"
+            if is_dependency else f"recovery:{source_id}:{comment_id}"
+        )
+
+        if is_dependency and any(
+            payload.get("idempotency_key") == idemp_key
+            for payload in _recovery_dispatch_payloads(conn, source_id)
+        ):
+            # Finding identity is durable audit state, not successor liveness.
+            # Archiving/deleting/completing a fixer cannot manufacture another
+            # remediation for unchanged reviewer feedback.
+            result.skipped_idempotent.append(source_id)
+            continue
 
         # Build successor task fields
         original_title = row["title"] or "untitled"
@@ -9184,20 +9379,37 @@ def recover_blocked_tasks(
         # should fix its own finding. The dispatcher passes a configured fixer
         # (with a profile fallback); absent that route, leave the source blocked.
         assignee = fixer_assignee if is_dependency else row["assignee"]
-        if not assignee:
+        if is_dependency and not assignee:
             result.skipped_unroutable.append(source_id)
             continue
 
         # Create the successor task via the public API — respects all
         # schema fields, validation, normalisation, and the "created"
-        # audit event that create_task emits.  ``initial_status="ready"``
-        # ensures the successor is immediately dispatchable regardless
-        # of parent state.
-        prior_successor = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' LIMIT 1",
-            (idemp_key,),
-        ).fetchone()
+        # audit event that create_task emits. Dependency remediation starts
+        # blocked: a later transaction publishes the successor, links it, and
+        # releases the review atomically, so no claimant can observe an
+        # unlinked runnable fixer. Generic recovery keeps its historical ready
+        # behavior because it has no source-task dependency edge to establish.
+        if is_dependency:
+            prior_successor = conn.execute(
+                "SELECT id, status FROM tasks WHERE idempotency_key = ? "
+                "ORDER BY CASE WHEN status = 'archived' THEN 1 ELSE 0 END, "
+                "created_at DESC LIMIT 1",
+                (idemp_key,),
+            ).fetchone()
+        else:
+            prior_successor = conn.execute(
+                "SELECT id, status FROM tasks WHERE idempotency_key = ? "
+                "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                (idemp_key,),
+            ).fetchone()
+        if (
+            is_dependency
+            and prior_successor is not None
+            and prior_successor["status"] == "archived"
+        ):
+            result.skipped_idempotent.append(source_id)
+            continue
         successor_id = create_task(
             conn,
             title=successor_title,
@@ -9213,8 +9425,9 @@ def recover_blocked_tasks(
             tenant=row["tenant"] if is_dependency else None,
             project_id=row["project_id"] if is_dependency else None,
             idempotency_key=idemp_key,
-            initial_status="ready",
+            initial_status="blocked" if is_dependency else "ready",
             classification="remediation" if is_dependency else "task",
+            _initial_block_kind="dependency" if is_dependency else None,
         )
 
         # Atomically check-then-emit audit events inside a single
@@ -9227,9 +9440,9 @@ def recover_blocked_tasks(
         # row inside the same transaction that inserts it, at most one
         # caller can succeed — the second sees the row and skips.
         with write_txn(conn):
-            # Scope idempotency to this source+comment key. A later review
-            # comment legitimately creates a new recovery successor, so an
-            # earlier recovery event for the same source must not suppress it.
+            # Scope idempotency to this source+finding key. A materially new
+            # finding gets a new fingerprint; successor status never changes
+            # the identity of an already-dispatched finding.
             dispatched_rows = conn.execute(
                 "SELECT payload FROM task_events "
                 "WHERE task_id = ? AND kind = 'recovery_dispatched'",
@@ -9239,16 +9452,20 @@ def recover_blocked_tasks(
             for event in dispatched_rows:
                 try:
                     event_payload = json.loads(event["payload"] or "{}")
-                    event_key = event_payload.get("idempotency_key")
-                    event_successor = event_payload.get("successor_id")
+                    event_key = (
+                        event_payload.get("idempotency_key")
+                        if isinstance(event_payload, dict) else None
+                    )
+                    event_successor = (
+                        event_payload.get("successor_id")
+                        if isinstance(event_payload, dict) else None
+                    )
                 except (TypeError, ValueError):
                     event_key = None
                     event_successor = None
-                # Archived successors no longer occupy the live idempotency
-                # key, so create_task may legitimately return a replacement.
-                # Deduplicate only the same live successor, not every historical
-                # task that ever carried this finding fingerprint.
-                if event_key == idemp_key and event_successor == successor_id:
+                if event_key == idemp_key and (
+                    is_dependency or event_successor == successor_id
+                ):
                     already_dispatched = True
                     break
             if already_dispatched:
@@ -9256,9 +9473,101 @@ def recover_blocked_tasks(
                 continue
 
             if is_dependency:
+                current_source = conn.execute(
+                    "SELECT status, block_kind FROM tasks WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                pending_parent = conn.execute(
+                    "SELECT 1 FROM task_links l "
+                    "JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ? "
+                    "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                    (source_id,),
+                ).fetchone()
+                current_comments = conn.execute(
+                    "SELECT body FROM task_comments WHERE task_id = ?",
+                    (source_id,),
+                ).fetchall()
+                safety_hit_now = any(
+                    any(
+                        marker in (comment["body"] or "").lower()
+                        for marker in _RECOVERY_SAFETY_SKIP_COMMENT_MARKERS
+                    )
+                    for comment in current_comments
+                )
+                current_kind = (
+                    (current_source["block_kind"] or "").lower()
+                    if current_source is not None else ""
+                )
+                current_fingerprint = _recovery_finding_fingerprint(
+                    _current_dependency_finding(conn, source_id)
+                )
+                current_generation = _current_dependency_generation(conn, source_id)
+                source_changed = (
+                    current_source is None
+                    or current_source["status"] != "blocked"
+                    or current_kind != "dependency"
+                    or pending_parent is not None
+                    or safety_hit_now
+                    or current_fingerprint != fingerprint
+                    or current_generation != dependency_generation
+                )
+                if source_changed:
+                    # create_task commits independently. Retire the private
+                    # successor if the source generation changed before the
+                    # link/release/publish transaction. A newly linked live
+                    # parent wins and returns the review to an ordinary wait.
+                    conn.execute(
+                        "UPDATE tasks SET status = 'archived' "
+                        "WHERE id = ? AND status = 'blocked' "
+                        "AND block_kind = 'dependency' "
+                        "AND created_by = 'recovery-queue' "
+                        "AND idempotency_key = ?",
+                        (successor_id, idemp_key),
+                    )
+                    if (
+                        pending_parent is not None
+                        and current_source is not None
+                        and current_source["status"] == "blocked"
+                        and current_kind == "dependency"
+                    ):
+                        moved = conn.execute(
+                            "UPDATE tasks SET status = 'todo' "
+                            "WHERE id = ? AND status = 'blocked' "
+                            "AND block_kind = 'dependency'",
+                            (source_id,),
+                        )
+                        if moved.rowcount == 1:
+                            _append_event(
+                                conn, source_id, "dependency_bound",
+                                {"status": "todo"},
+                            )
+                    if safety_hit_now or current_kind in _RECOVERY_SAFETY_SKIP_BLOCK_KINDS:
+                        result.skipped_safety.append(source_id)
+                    continue
+
+                successor_state = conn.execute(
+                    "SELECT status, block_kind, created_by, idempotency_key "
+                    "FROM tasks "
+                    "WHERE id = ?",
+                    (successor_id,),
+                ).fetchone()
+                if (
+                    successor_state is None
+                    or successor_state["status"] != "blocked"
+                    or successor_state["block_kind"] != "dependency"
+                    or successor_state["created_by"] != "recovery-queue"
+                    or successor_state["idempotency_key"] != idemp_key
+                ):
+                    # The task changed after create_task committed (for example,
+                    # an operator archived it). Do not attach a stale/non-private
+                    # successor and never release the review against it.
+                    continue
+
                 # The remediation is a real prerequisite, not advisory text.
-                # Link it before releasing the review so recompute_ready can
-                # never observe a runnable review against unchanged state.
+                # The successor is still private (blocked) under this write
+                # lock. Link it before releasing the review, then publish it;
+                # all three state changes become visible at the same commit.
                 conn.execute(
                     "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                     "VALUES (?, ?)",
@@ -9282,11 +9591,26 @@ def recover_blocked_tasks(
                         # just created so it cannot dispatch as orphaned work.
                         conn.execute(
                             "UPDATE tasks SET status = 'archived' "
-                            "WHERE id = ? AND status = 'ready' "
+                            "WHERE id = ? AND status = 'blocked' "
                             "AND created_by = 'recovery-queue'",
                             (successor_id,),
                         )
                     continue
+                published = conn.execute(
+                    "UPDATE tasks SET status = 'ready', block_kind = NULL "
+                    "WHERE id = ? AND status = 'blocked' "
+                    "AND block_kind = 'dependency' "
+                    "AND created_by = 'recovery-queue' "
+                    "AND idempotency_key = ?",
+                    (successor_id, idemp_key),
+                )
+                if published.rowcount != 1:
+                    # This should be unreachable while holding BEGIN IMMEDIATE,
+                    # but rollback rather than commit a released review whose
+                    # remediation did not become dispatchable.
+                    raise RuntimeError(
+                        f"failed to publish remediation successor {successor_id}"
+                    )
 
             _append_event(
                 conn, source_id, "recovery_dispatched",

@@ -478,6 +478,55 @@ def test_daemon_keeps_going_after_tick_exception(kanban_home, monkeypatch):
     assert calls[0] >= 2
 
 
+def test_run_daemon_passes_recovery_fixer_assignee(kanban_home, monkeypatch):
+    """The legacy daemon must preserve the configured remediation route."""
+    captured = {}
+    stop = threading.Event()
+
+    def _dispatch(conn, **kwargs):
+        captured.update(kwargs)
+        stop.set()
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", _dispatch)
+
+    kb.run_daemon(
+        interval=0.01,
+        stop_event=stop,
+        recovery_fixer_assignee="code-fixer",
+    )
+
+    assert captured["recovery_fixer_assignee"] == "code-fixer"
+
+
+def test_cli_forced_daemon_loads_recovery_fixer_config(
+    kanban_home, monkeypatch, capsys,
+):
+    """`kanban daemon --force` must load the same fixer route as dispatch."""
+    from hermes_cli import config as hermes_config
+    from hermes_cli import kanban as kb_cli
+
+    captured = {}
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"recovery_fixer_assignee": "code-fixer"}},
+    )
+    monkeypatch.setattr(kb, "run_daemon", lambda **kwargs: captured.update(kwargs))
+    args = argparse.Namespace(
+        force=True,
+        interval=60.0,
+        max=None,
+        failure_limit=3,
+        pidfile=None,
+        verbose=False,
+    )
+
+    assert kb_cli._cmd_daemon(args) == 0
+    assert captured["recovery_fixer_assignee"] == "code-fixer"
+    capsys.readouterr()
+
+
 # ---------------------------------------------------------------------------
 # Stats + age
 # ---------------------------------------------------------------------------

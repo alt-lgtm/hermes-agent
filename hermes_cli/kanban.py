@@ -2274,6 +2274,19 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # correct DB path and any init error surfaces immediately.
     kb.init_db()
 
+    try:
+        from hermes_cli.config import load_config
+
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        recovery_fixer_assignee = (
+            (_kanban_cfg.get("recovery_fixer_assignee") or "").strip()
+            or default_assignee
+        )
+    except Exception:
+        recovery_fixer_assignee = None
+
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
         try:
@@ -2361,6 +2374,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            recovery_fixer_assignee=recovery_fixer_assignee,
             on_tick=_on_tick,
         )
     finally:
